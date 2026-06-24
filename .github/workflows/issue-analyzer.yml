@@ -3,17 +3,178 @@ name: Issue Analyzer
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: 'owner/repo (e.g. SikamikanikoBG/homelab-monitor)'
+        required: true
+        type: string
       issue:
+        description: 'Issue number'
         required: true
         type: number
 
 jobs:
   analyze:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch issue
+      - name: Analyze Issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REPO: ${{ inputs.repo }}
+          ISSUE_NUM: ${{ inputs.issue }}
         run: |
-          echo "fake issue analyzer running"
+          python3 << 'EOF'
+          import os, json, urllib.request, urllib.error
+
+          token = os.environ["GH_TOKEN"]
+          anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "")
+          repo = os.environ["REPO"]
+          issue_num = os.environ["ISSUE_NUM"]
+
+          def gh(path):
+              req = urllib.request.Request(
+                  f"https://api.github.com{path}",
+                  headers={"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+              )
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      return json.loads(r.read())
+              except:
+                  return {}
+
+          # Fetch issue
+          issue = gh(f"/repos/{repo}/issues/{issue_num}")
+          title = issue.get("title", "")
+          body = issue.get("body", "") or ""
+          assignees = [a["login"] for a in issue.get("assignees", [])]
+          state = issue.get("state", "")
+
+          print(f"\n{'='*60}")
+          print(f"ISSUE #{issue_num}: {title}")
+          print(f"State: {state} | Assignees: {assignees or 'none'}")
+          print(f"{'='*60}\n")
+
+          # Check for open PRs already addressing this issue
+          prs = gh(f"/repos/{repo}/pulls?state=open&per_page=50")
+          related_prs = []
+          if isinstance(prs, list):
+              for pr in prs:
+                  pr_body = (pr.get("body") or "").lower()
+                  if f"#{issue_num}" in pr_body or f"closes #{issue_num}" in pr_body or f"fixes #{issue_num}" in pr_body:
+                      related_prs.append(f"#{pr['number']} by {pr['user']['login']}: {pr['title']}")
+
+          if related_prs:
+              print("⚠️  CONFLICT WARNING — Open PRs already referencing this issue:")
+              for pr in related_prs:
+                  print(f"  {pr}")
+          else:
+              print("✅ No open PRs found referencing this issue")
+
+          # Check comments for existing claims
+          comments = gh(f"/repos/{repo}/issues/{issue_num}/comments")
+          claim_keywords = ["i would like", "i'd like", "working on", "i'll take", "claiming", "i can work"]
+          claims = []
+          if isinstance(comments, list):
+              for c in comments:
+                  if any(k in (c.get("body") or "").lower() for k in claim_keywords):
+                      claims.append(f"{c['user']['login']}: {c['body'][:100]}")
+          if claims:
+              print("\n⚠️  EXISTING CLAIMS in comments:")
+              for cl in claims:
+                  print(f"  {cl}")
+          else:
+              print("✅ No existing claims found in comments")
+
+          # Get repo file tree to find relevant files
+          repo_info = gh(f"/repos/{repo}")
+          default_branch = repo_info.get("default_branch", "main")
+
+          branch = gh(f"/repos/{repo}/branches/{default_branch}")
+
+          tree_sha = (
+              branch.get("commit", {})
+                    .get("commit", {})
+                    .get("tree", {})
+                    .get("sha", "")
+          )
+
+          tree = gh(f"/repos/{repo}/git/trees/{tree_sha}?recursive=1")
+
+          SOURCE_EXTS = (
+              ".py", ".go", ".rs",
+              ".js", ".ts", ".tsx",
+              ".jsx", ".java",
+              ".c", ".cpp", ".h",
+              ".hpp", ".sh"
+          )
+
+          files = [
+              f["path"]
+              for f in tree.get("tree", [])
+              if f.get("type") == "blob"
+              and f["path"].endswith(SOURCE_EXTS)
+          ]
+
+          # Simple keyword matching from issue title+body
+          keywords = set()
+          for word in (title + " " + body).lower().split():
+              word = word.strip(".,():[]`*#/")
+              if len(word) > 4 and word.isalpha():
+                  keywords.add(word)
+
+          relevant = []
+          for f in files:
+              fname = f.lower()
+              score = sum(1 for k in keywords if k in fname)
+              if score > 0:
+                  relevant.append((score, f))
+          relevant.sort(reverse=True)
+
+          print(f"\n📁 POTENTIALLY RELEVANT FILES (top 10):")
+          for score, f in relevant[:10]:
+              print(f"  [{score}] {f}")
+
+          if not relevant:
+              print("  (no strong file matches — check repo structure manually)")
+
+          # Claude analysis if API key available
+          if anthropic_key and len(body) > 20:
+              print("\n🤖 CLAUDE ANALYSIS:")
+              payload = json.dumps({
+                  "model": "claude-sonnet-4-6",
+                  "max_tokens": 1000,
+                  "messages": [{
+                      "role": "user",
+                      "content": f"You are a senior engineer helping assess a GitHub issue. Give a concise implementation plan.\n\nISSUE TITLE: {title}\n\nISSUE BODY:\n{body[:2000]}\n\nRELEVANT FILES FOUND:\n{chr(10).join(f for _,f in relevant[:10])}\n\nProvide:\n1. Root cause / what needs to change (2-3 sentences)\n2. Implementation steps (numbered, specific file names)\n3. Testing approach (1-2 sentences)\n4. Estimated complexity: trivial/small/medium/large"
+                  }]
+              }).encode()
+              req = urllib.request.Request(
+                  "https://api.anthropic.com/v1/messages",
+                  data=payload,
+                  headers={
+                      "x-api-key": anthropic_key,
+                      "anthropic-version": "2023-06-01",
+                      "content-type": "application/json"
+                  }
+              )
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      resp = json.loads(r.read())
+                      print(resp["content"][0]["text"])
+              except Exception as e:
+                  print(f"  (Claude unavailable: {e})")
+          else:
+              print("\n💡 Add ANTHROPIC_API_KEY secret to enable AI-powered analysis")
+
+          print(f"\n{'='*60}")
+          print("SUMMARY")
+          print(f"{'='*60}")
+          print(f"Repo: {repo} | Issue: #{issue_num}")
+          print(f"Safe to claim: {'NO ⚠️' if (related_prs or claims or assignees) else 'YES ✅'}")
+          print(f"Relevant files found: {len(relevant)}")
+          EOF
