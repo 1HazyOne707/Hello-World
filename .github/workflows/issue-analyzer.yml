@@ -1,0 +1,19 @@
+name: Issue Analyzer
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue:
+        required: true
+        type: number
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch issue
+        run: |
+          echo "fake issue analyzer running"
